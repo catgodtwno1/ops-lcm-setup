@@ -78,70 +78,23 @@ openclaw config set plugins.slots.contextEngine lossless-claw
 
 ### 5.5 CJK 搜索（lcm_grep）召回率低
 
-**症狀**：`lcm_grep` 搜中文關鍵詞返回空結果或命中極少，但 summary 確實包含相關內容。
+**狀態**：✅ 已在 LCM 0.53 原生修復（2026-04-03）
 
-**根因**：
+**原始症狀**：`lcm_grep` 搜中文關鍵詞返回空結果或命中極少，但 summary 確實包含相關內容。
+
+**原始根因**：
 - FTS5 默認使用 porter tokenizer，對 CJK 文字分詞效果差
 - 原始搜索邏輯用 AND 語義連接 bigram tokens，導致只要一個 bigram 不命中就全部失敗
-- 沒有 trigram 索引表做子字串匹配
 
-**修復**（已套用在 Scott#1 的 `~/.openclaw/extensions/lossless-claw/`）：
+**修復歷程**：
+1. **臨時補丁（已移除）**：手動在 `~/.openclaw/extensions/lossless-claw/` 加入 trigram FTS 虛擬表 + OR 語義搜索
+2. **正式修復（LCM 0.53+）**：上游原生支援 CJK 搜索，不再需要本地補丁
+   - S4 已於 2026-04-03 移除所有機器上的 trigram 補丁
 
-#### 修改 1：migration.ts — 新增 CJK trigram FTS 虛擬表
-
-位置：`src/db/migration.ts`
-
-```sql
-CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
-  summary_id UNINDEXED,
-  content,
-  tokenize='trigram'
-);
--- 回填既有 summaries
-INSERT INTO summaries_fts_cjk(summary_id, content)
-  SELECT summary_id, content FROM summaries;
-```
-
-`trigram` tokenizer 對 CJK 做 3-char 滑動窗口索引，支援任意子字串 MATCH。
-
-#### 修改 2：summary-store.ts — 雙層搜索 + OR 語義
-
-位置：`src/store/summary-store.ts`
-
-**寫入時**同步插入 trigram 表：
-```typescript
-// summary 寫入後追加
-this.db
-  .prepare(`INSERT INTO summaries_fts_cjk(summary_id, content) VALUES (?, ?)`)
-  .run(input.summaryId, input.content);
-```
-
-**搜索時**先走 trigram 表，再 fallback 到 LIKE OR：
-
-1. **searchCjkTrigram()**：
-   - 提取 CJK 段落（≥3 字元），拆成 4-char + 3-char 滑動窗口
-   - 各 chunk 用 FTS5 MATCH 搜索，**OR 語義**合併
-   - 非 CJK tokens（英文/數字）同時搜 porter FTS 表，合併結果
-
-2. **searchLikeCjk()**（fallback）：
-   - 提取 CJK bigrams（2-char 滑動窗口）
-   - 每個 bigram 用 `LIKE '%xx%'` 搜索，**OR 語義**（任一命中即返回）
-   - 結果按 created_at DESC 排序
-
-**關鍵改動**：原始碼搜 CJK 走 `searchLike()`，用 AND 語義；修改後改為 OR 語義（trigram 優先 → LIKE OR fallback）。
-
-#### 驗證
-
+**驗證**：
 ```bash
-# 確認 trigram 表存在
-sqlite3 ~/.openclaw/lcm.db "SELECT COUNT(*) FROM summaries_fts_cjk;"
-
-# 測試 CJK 搜索
-# 在 OpenClaw 會話中：
-# lcm_grep(pattern="彩尚SEO", mode="full_text")
-# 應返回相關 summary snippets
+# 測試 CJK 搜索（不需要 trigram 表）
+# lcm_grep(pattern="測試關鍵詞", mode="full_text")
+# 應正常返回相關 summary snippets
 ```
-
-**狀態**：已在 Scott#1 本地套用，未提交上游 PR。修改在 `~/.openclaw/extensions/lossless-claw/src/` 的 `summary-store.ts` 和 `db/migration.ts`。
-備份：`summary-store.ts.bak`（原始版本）。
 
